@@ -1,31 +1,3 @@
-'''
-Now that you understand the agent loop and how to craft effective prompts, we can build a simple AI agent. 
-This agent will be able to list files in a directory, read their content, and answer questions about them. 
-We'll break down the agent loop—how it receives input, decides on actions, executes them, and updates its 
-memory—step by step.
-
-The agent loop is the backbone of our AI agent, enabling it to perform tasks by combining response generation, 
-action execution, and memory updates in an iterative process. This section focuses on how the agent loop works 
-and its role in making the agent dynamic and adaptive.
-
-Here's the rewrite of the steps using the more descriptive and cohesive style from the original explanation:
-1. Construct Prompt: Combine the agent's memory, user input, and system rules into a single prompt. This ensures 
-    the LLM has all the context it needs to decide on the next action, maintaining continuity across iterations.
-2. Generate Response: Send the constructed prompt to the LLM and retrieve a response. This response will guide 
-    the agent's next step by providing instructions in a structured format.
-3. Parse Response: Extract the intended action and its parameters from the LLM's output. The response must adhere 
-    to a predefined structure (e.g., JSON format) to ensure it can be interpreted correctly.
-4. Execute Action: Use the extracted action and its parameters to perform the requested task with the appropriate 
-    tool. This could involve listing files, reading content, or printing a message.
-5. Convert Result to String: Format the result of the executed action into a string. This allows the agent to store 
-    the result in its memory and provide clear feedback to the user or itself.
-6. Continue Loop?: Evaluate whether the loop should continue based on the current action and results. The loop may 
-    terminate if a “terminate” action is specified or if the agent has completed the task.
-
-The agent iterates through this loop, refining its behavior and adapting its actions until it reaches a stopping 
-condition. This process is what enables the agent to interact dynamically and respond intelligently to tasks.
-'''
-
 import sys
 import os
 
