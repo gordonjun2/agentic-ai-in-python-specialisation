@@ -14,11 +14,30 @@ import inspect
 from litellm import completion
 from dataclasses import dataclass, field
 from typing import get_type_hints, List, Callable, Dict, Any
+import uuid
 
 os.environ['OPENAI_API_KEY'] = OPENAI_API_KEY
 
 tools = {}
 tools_by_tag = {}
+
+
+def has_named_parameter(func, name: str) -> bool:
+    """
+    Check if the given function has a parameter with the specified name.
+    
+    Parameters:
+        func: The function to inspect.
+        name: The name of the parameter to check for.
+        
+    Returns:
+        True if the parameter exists in the function signature, False otherwise.
+    """
+    try:
+        sig = inspect.signature(func)
+        return name in sig.parameters
+    except:
+        return False
 
 
 def get_tool_metadata(func,
@@ -27,78 +46,34 @@ def get_tool_metadata(func,
                       parameters_override=None,
                       terminal=False,
                       tags=None):
-    """
-    Extracts metadata for a function to use in tool registration.
+    """Extract metadata while ignoring special parameters."""
+    signature = inspect.signature(func)
+    type_hints = get_type_hints(func)
 
-    Parameters:
-        func (function): The function to extract metadata from.
-        tool_name (str, optional): The name of the tool. Defaults to the function name.
-        description (str, optional): Description of the tool. Defaults to the function's docstring.
-        parameters_override (dict, optional): Override for the argument schema. Defaults to dynamically inferred schema.
-        terminal (bool, optional): Whether the tool is terminal. Defaults to False.
-        tags (List[str], optional): List of tags to associate with the tool.
+    args_schema = {"type": "object", "properties": {}, "required": []}
 
-    Returns:
-        dict: A dictionary containing metadata about the tool, including description, args schema, and the function.
-    """
-    # Default tool_name to the function name if not provided
-    tool_name = tool_name or func.__name__
+    for param_name, param in signature.parameters.items():
+        # Skip special parameters - agent doesn't need to know about these
+        if param_name in ["action_context", "action_agent"] or \
+           param_name.startswith("_"):
+            continue
 
-    # Default description to the function's docstring if not provided
-    description = description or (func.__doc__.strip() if func.__doc__ else
-                                  "No description provided.")
+        # Add regular parameters to the schema
+        param_type = type_hints.get(param_name, str)
+        args_schema["properties"][param_name] = {
+            "type": "string"  # Simplified for example
+        }
 
-    # Discover the function's signature and type hints if no args_override is provided
-    if parameters_override is None:
-        signature = inspect.signature(func)
-        type_hints = get_type_hints(func)
+        if param.default == param.empty:
+            args_schema["required"].append(param_name)
 
-        # Build the arguments schema dynamically
-        args_schema = {"type": "object", "properties": {}, "required": []}
-        for param_name, param in signature.parameters.items():
-
-            if param_name in ["action_context", "action_agent"]:
-                continue  # Skip these parameters
-
-            def get_json_type(param_type):
-                if param_type == str:
-                    return "string"
-                elif param_type == int:
-                    return "integer"
-                elif param_type == float:
-                    return "number"
-                elif param_type == bool:
-                    return "boolean"
-                elif param_type == list:
-                    return "array"
-                elif param_type == dict:
-                    return "object"
-                else:
-                    return "string"
-
-            # Add parameter details
-            param_type = type_hints.get(
-                param_name, str)  # Default to string if type is not annotated
-            param_schema = {
-                "type": get_json_type(param_type)
-            }  # Convert Python types to JSON schema types
-
-            args_schema["properties"][param_name] = param_schema
-
-            # Add to required if not defaulted
-            if param.default == inspect.Parameter.empty:
-                args_schema["required"].append(param_name)
-    else:
-        args_schema = parameters_override
-
-    # Return the metadata as a dictionary
     return {
-        "tool_name": tool_name,
-        "description": description,
+        "name": tool_name or func.__name__,
+        "description": description or func.__doc__,
         "parameters": args_schema,
-        "function": func,
+        "tags": tags or [],
         "terminal": terminal,
-        "tags": tags or []
+        "function": func
     }
 
 
@@ -131,7 +106,7 @@ def register_tool(tool_name=None,
                                      tags=tags)
 
         # Register the tool in the global dictionary
-        tools[metadata["tool_name"]] = {
+        tools[metadata["name"]] = {
             "description": metadata["description"],
             "parameters": metadata["parameters"],
             "function": metadata["function"],
@@ -142,7 +117,7 @@ def register_tool(tool_name=None,
         for tag in metadata["tags"]:
             if tag not in tools_by_tag:
                 tools_by_tag[tag] = []
-            tools_by_tag[tag].append(metadata["tool_name"])
+            tools_by_tag[tag].append(metadata["name"])
 
         return func
 
@@ -231,6 +206,19 @@ class ActionRegistry:
         return list(self.actions.values())
 
 
+class ActionContext:
+
+    def __init__(self, properties: Dict = None):
+        self.context_id = str(uuid.uuid4())
+        self.properties = properties or {}
+
+    def get(self, key: str, default=None):
+        return self.properties.get(key, default)
+
+    def get_memory(self):
+        return self.properties.get("memory", None)
+
+
 class Memory:
 
     def __init__(self):
@@ -254,7 +242,8 @@ class Memory:
 
 class Environment:
 
-    def execute_action(self, action: Action, args: dict) -> dict:
+    def execute_action(self, action_context: ActionContext, action: Action,
+                       args: dict) -> dict:
         """Execute an action and return the result."""
         try:
             result = action.execute(**args)
@@ -273,6 +262,32 @@ class Environment:
             "result": result,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z")
         }
+
+
+class PythonEnvironment(Environment):
+
+    def execute_action(self, action_context: ActionContext, action: Action,
+                       args: dict) -> dict:
+        """Execute an action with automatic dependency injection."""
+        try:
+            # Create a copy of args to avoid modifying the original
+            args_copy = args.copy()
+
+            # If the function wants action_context, provide it
+            if has_named_parameter(action.function, "action_context"):
+                args_copy["action_context"] = action_context
+
+            # Inject properties from action_context that match _prefixed parameters
+            for key, value in action_context.properties.items():
+                param_name = "_" + key
+                if has_named_parameter(action.function, param_name):
+                    args_copy[param_name] = value
+
+            # Execute the function with injected dependencies
+            result = action.execute(**args_copy)
+            return self.format_result(result)
+        except Exception as e:
+            return {"tool_executed": False, "error": str(e)}
 
 
 class AgentLanguage:
@@ -364,6 +379,7 @@ class AgentFunctionCallingActionLanguage(AgentLanguage):
             return json.loads(response)
 
         except Exception as e:
+            print(e)
             return {"tool": "terminate", "args": {"message": response}}
 
 
@@ -419,7 +435,8 @@ class Agent:
         self.actions = action_registry
         self.environment = environment
 
-    def construct_prompt(self, goals: List[Goal], memory: Memory,
+    def construct_prompt(self, action_context: ActionContext,
+                         goals: List[Goal], memory: Memory,
                          actions: ActionRegistry) -> Prompt:
         """Build prompt with memory context"""
         return self.agent_language.construct_prompt(
@@ -454,35 +471,50 @@ class Agent:
         for m in new_memories:
             memory.add_memory(m)
 
-    def prompt_llm_for_action(self, full_prompt: Prompt) -> str:
+    def prompt_llm_for_action(self, action_context: ActionContext,
+                              full_prompt: Prompt) -> str:
         response = self.generate_response(full_prompt)
         return response
+
+    def handle_agent_response(self, action_context: ActionContext,
+                              response: str) -> dict:
+        """Handle action without dependency management."""
+        action_def, action = self.get_action(response)
+
+        result = self.environment.execute_action(action_context, action_def,
+                                                 action["args"])
+        return result
 
     def run(self,
             user_input: str,
             memory=None,
-            max_iterations: int = 50) -> Memory:
+            max_iterations: int = 50,
+            action_context_props=None) -> Memory:
         """
         Execute the GAME loop for this agent with a maximum iteration limit.
         """
         memory = memory or Memory()
         self.set_current_task(memory, user_input)
 
+        # Create context with all necessary resources
+        action_context = ActionContext({
+            'memory': memory,
+            'llm': self.generate_response,
+            **action_context_props
+        })
+
         for _ in range(max_iterations):
             # Construct a prompt that includes the Goals, Actions, and the current Memory
-            prompt = self.construct_prompt(self.goals, memory, self.actions)
+            prompt = self.construct_prompt(action_context, self.goals, memory,
+                                           self.actions)
 
             print("Agent thinking...")
             # Generate a response from the agent
-            response = self.prompt_llm_for_action(prompt)
+            response = self.prompt_llm_for_action(action_context, prompt)
             print(f"Agent Decision: {response}")
 
-            # Determine which action the agent wants to execute
-            action, invocation = self.get_action(response)
-
-            # Execute the action in the environment
-            result = self.environment.execute_action(action,
-                                                     invocation["args"])
+            # Determine which action the agent wants to execute and execute the action in the environment
+            result = self.handle_agent_response(action_context, response)
             print(f"Action Result: {result}")
 
             # Update the agent's memory with information about what happened
@@ -658,21 +690,36 @@ def store_invoice(action_context: ActionContext, invoice_data: dict) -> dict:
     }
 
 
+@register_tool(tags=["system"], terminal=True)
+def terminate(message: str) -> str:
+    """Terminates the agent's execution with a final message.
+
+    Args:
+        message: The final message to return before terminating
+
+    Returns:
+        The message with a termination note appended
+    """
+    return f"{message}\nTerminating..."
+
+
 def create_invoice_agent():
     # Create action registry with our invoice tools
     action_registry = PythonActionRegistry()
 
     # Create our base environment
-    environment = Environment()
+    environment = PythonEnvironment()
 
     # Define our invoice processing goals
     goals = [
         Goal(
+            priority=1,
             name="Persona",
             description=
             "You are an Invoice Processing Agent, specialized in handling and storing invoice data."
         ),
-        Goal(name="Process Invoices",
+        Goal(priority=1,
+             name="Process Invoices",
              description="""
             Your goal is to process invoices by extracting their data and storing it properly.
             For each invoice:
@@ -695,9 +742,20 @@ def main():
 
     agent = create_invoice_agent()
 
-    # Run the agent with user input
-    user_input = "Write a README for this project."
-    final_memory = agent.run(user_input)
+    # Run the agent with invoice input
+    invoice_text = """
+        Invoice #4567
+        Date: 2025-02-01
+        Vendor: Tech Solutions Inc.
+        Items: 
+        - Laptop - $1,200
+        - External Monitor - $300
+        Total: $1,500
+    """
+    final_memory = agent.run(f"Process this invoice:\n\n{invoice_text}",
+                             action_context_props={
+                                 "invoice_storage": {},
+                             })
     print(final_memory.get_memories())
 
 
