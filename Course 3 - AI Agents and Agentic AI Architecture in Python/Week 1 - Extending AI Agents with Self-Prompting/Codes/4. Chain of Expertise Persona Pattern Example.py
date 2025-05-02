@@ -14,11 +14,56 @@ import inspect
 from litellm import completion
 from dataclasses import dataclass, field
 from typing import get_type_hints, List, Callable, Dict, Any
+import uuid
+import tiktoken
 
 os.environ['OPENAI_API_KEY'] = OPENAI_API_KEY
 
 tools = {}
 tools_by_tag = {}
+
+
+def count_tokens(messages):
+    encoding = tiktoken.get_encoding("cl100k_base")  # The GPT-4 tokenizer
+    total_tokens = 0
+
+    for message in messages:
+        total_tokens += len(encoding.encode(message["content"]))
+
+    return total_tokens
+
+
+def recursive_json_loads(value):
+    if isinstance(value, str):
+        try:
+            loaded = json.loads(value)
+            return recursive_json_loads(loaded)
+        except json.JSONDecodeError:
+            return value
+    elif isinstance(value, dict):
+        return {k: recursive_json_loads(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [recursive_json_loads(item) for item in value]
+    else:
+        return value
+
+
+def has_named_parameter(func, name: str) -> bool:
+    """
+    Check if the given function has a parameter with the specified name.
+    
+    Parameters:
+        func: The function to inspect.
+        name: The name of the parameter to check for.
+        
+    Returns:
+        True if the parameter exists in the function signature, False otherwise.
+    """
+    try:
+        sig = inspect.signature(func)
+        return name in sig.parameters
+    except:
+        return False
 
 
 def get_tool_metadata(func,
@@ -27,78 +72,34 @@ def get_tool_metadata(func,
                       parameters_override=None,
                       terminal=False,
                       tags=None):
-    """
-    Extracts metadata for a function to use in tool registration.
+    """Extract metadata while ignoring special parameters."""
+    signature = inspect.signature(func)
+    type_hints = get_type_hints(func)
 
-    Parameters:
-        func (function): The function to extract metadata from.
-        tool_name (str, optional): The name of the tool. Defaults to the function name.
-        description (str, optional): Description of the tool. Defaults to the function's docstring.
-        parameters_override (dict, optional): Override for the argument schema. Defaults to dynamically inferred schema.
-        terminal (bool, optional): Whether the tool is terminal. Defaults to False.
-        tags (List[str], optional): List of tags to associate with the tool.
+    args_schema = {"type": "object", "properties": {}, "required": []}
 
-    Returns:
-        dict: A dictionary containing metadata about the tool, including description, args schema, and the function.
-    """
-    # Default tool_name to the function name if not provided
-    tool_name = tool_name or func.__name__
+    for param_name, param in signature.parameters.items():
+        # Skip special parameters - agent doesn't need to know about these
+        if param_name in ["action_context", "action_agent"] or \
+           param_name.startswith("_"):
+            continue
 
-    # Default description to the function's docstring if not provided
-    description = description or (func.__doc__.strip() if func.__doc__ else
-                                  "No description provided.")
+        # Add regular parameters to the schema
+        param_type = type_hints.get(param_name, str)
+        args_schema["properties"][param_name] = {
+            "type": "string"  # Simplified for example
+        }
 
-    # Discover the function's signature and type hints if no args_override is provided
-    if parameters_override is None:
-        signature = inspect.signature(func)
-        type_hints = get_type_hints(func)
+        if param.default == param.empty:
+            args_schema["required"].append(param_name)
 
-        # Build the arguments schema dynamically
-        args_schema = {"type": "object", "properties": {}, "required": []}
-        for param_name, param in signature.parameters.items():
-
-            if param_name in ["action_context", "action_agent"]:
-                continue  # Skip these parameters
-
-            def get_json_type(param_type):
-                if param_type == str:
-                    return "string"
-                elif param_type == int:
-                    return "integer"
-                elif param_type == float:
-                    return "number"
-                elif param_type == bool:
-                    return "boolean"
-                elif param_type == list:
-                    return "array"
-                elif param_type == dict:
-                    return "object"
-                else:
-                    return "string"
-
-            # Add parameter details
-            param_type = type_hints.get(
-                param_name, str)  # Default to string if type is not annotated
-            param_schema = {
-                "type": get_json_type(param_type)
-            }  # Convert Python types to JSON schema types
-
-            args_schema["properties"][param_name] = param_schema
-
-            # Add to required if not defaulted
-            if param.default == inspect.Parameter.empty:
-                args_schema["required"].append(param_name)
-    else:
-        args_schema = parameters_override
-
-    # Return the metadata as a dictionary
     return {
-        "tool_name": tool_name,
-        "description": description,
+        "name": tool_name or func.__name__,
+        "description": description or func.__doc__,
         "parameters": args_schema,
-        "function": func,
+        "tags": tags or [],
         "terminal": terminal,
-        "tags": tags or []
+        "function": func
     }
 
 
@@ -131,7 +132,7 @@ def register_tool(tool_name=None,
                                      tags=tags)
 
         # Register the tool in the global dictionary
-        tools[metadata["tool_name"]] = {
+        tools[metadata["name"]] = {
             "description": metadata["description"],
             "parameters": metadata["parameters"],
             "function": metadata["function"],
@@ -142,7 +143,7 @@ def register_tool(tool_name=None,
         for tag in metadata["tags"]:
             if tag not in tools_by_tag:
                 tools_by_tag[tag] = []
-            tools_by_tag[tag].append(metadata["tool_name"])
+            tools_by_tag[tag].append(metadata["name"])
 
         return func
 
@@ -164,6 +165,9 @@ def generate_response(prompt: Prompt) -> str:
     tools = prompt.tools
 
     result = None
+
+    token_count = count_tokens(messages)
+    print(f"Total tokens: {token_count}")
 
     if not tools:
         response = completion(model="openai/gpt-4o",
@@ -231,6 +235,19 @@ class ActionRegistry:
         return list(self.actions.values())
 
 
+class ActionContext:
+
+    def __init__(self, properties: Dict = None):
+        self.context_id = str(uuid.uuid4())
+        self.properties = properties or {}
+
+    def get(self, key: str, default=None):
+        return self.properties.get(key, default)
+
+    def get_memory(self):
+        return self.properties.get("memory", None)
+
+
 class Memory:
 
     def __init__(self):
@@ -273,6 +290,32 @@ class Environment:
             "result": result,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z")
         }
+
+
+class PythonEnvironment(Environment):
+
+    def execute_action(self, action_context: ActionContext, action: Action,
+                       args: dict) -> dict:
+        """Execute an action with automatic dependency injection."""
+        try:
+            # Create a copy of args to avoid modifying the original
+            args_copy = args.copy()
+
+            # If the function wants action_context, provide it
+            if has_named_parameter(action.function, "action_context"):
+                args_copy["action_context"] = action_context
+
+            # Inject properties from action_context that match _prefixed parameters
+            for key, value in action_context.properties.items():
+                param_name = "_" + key
+                if has_named_parameter(action.function, param_name):
+                    args_copy[param_name] = value
+
+            # Execute the function with injected dependencies
+            result = action.execute(**args_copy)
+            return self.format_result(result)
+        except Exception as e:
+            return {"tool_executed": False, "error": str(e)}
 
 
 class AgentLanguage:
@@ -361,7 +404,7 @@ class AgentFunctionCallingActionLanguage(AgentLanguage):
         """Parse LLM response into structured format by extracting the ```json block"""
 
         try:
-            return json.loads(response)
+            return recursive_json_loads(response)
 
         except Exception as e:
             return {"tool": "terminate", "args": {"message": response}}
@@ -419,7 +462,8 @@ class Agent:
         self.actions = action_registry
         self.environment = environment
 
-    def construct_prompt(self, goals: List[Goal], memory: Memory,
+    def construct_prompt(self, action_context: ActionContext,
+                         goals: List[Goal], memory: Memory,
                          actions: ActionRegistry) -> Prompt:
         """Build prompt with memory context"""
         return self.agent_language.construct_prompt(
@@ -454,35 +498,50 @@ class Agent:
         for m in new_memories:
             memory.add_memory(m)
 
-    def prompt_llm_for_action(self, full_prompt: Prompt) -> str:
+    def prompt_llm_for_action(self, action_context: ActionContext,
+                              full_prompt: Prompt) -> str:
         response = self.generate_response(full_prompt)
         return response
+
+    def handle_agent_response(self, action_context: ActionContext,
+                              response: str) -> dict:
+        """Handle action without dependency management."""
+        action_def, action = self.get_action(response)
+
+        result = self.environment.execute_action(action_context, action_def,
+                                                 action["args"])
+        return result
 
     def run(self,
             user_input: str,
             memory=None,
-            max_iterations: int = 50) -> Memory:
+            max_iterations: int = 50,
+            action_context_props=None) -> Memory:
         """
         Execute the GAME loop for this agent with a maximum iteration limit.
         """
         memory = memory or Memory()
         self.set_current_task(memory, user_input)
 
+        # Create context with all necessary resources
+        action_context = ActionContext({
+            'memory': memory,
+            'llm': self.generate_response,
+            **action_context_props
+        })
+
         for _ in range(max_iterations):
             # Construct a prompt that includes the Goals, Actions, and the current Memory
-            prompt = self.construct_prompt(self.goals, memory, self.actions)
+            prompt = self.construct_prompt(action_context, self.goals, memory,
+                                           self.actions)
 
             print("Agent thinking...")
             # Generate a response from the agent
-            response = self.prompt_llm_for_action(prompt)
+            response = self.prompt_llm_for_action(action_context, prompt)
             print(f"Agent Decision: {response}")
 
-            # Determine which action the agent wants to execute
-            action, invocation = self.get_action(response)
-
-            # Execute the action in the environment
-            result = self.environment.execute_action(action,
-                                                     invocation["args"])
+            # Determine which action the agent wants to execute and execute the action in the environment
+            result = self.handle_agent_response(action_context, response)
             print(f"Action Result: {result}")
 
             # Update the agent's memory with information about what happened
@@ -495,55 +554,6 @@ class Agent:
         return memory
 
 
-@register_tool()
-def prompt_llm_for_json(action_context: ActionContext, schema: dict,
-                        prompt: str):
-    """
-    Have the LLM generate JSON in response to a prompt. Always use this tool when you need structured data out of the LLM.
-    This function takes a JSON schema that specifies the structure of the expected JSON response.
-    
-    Args:
-        schema: JSON schema defining the expected structure
-        prompt: The prompt to send to the LLM
-        
-    Returns:
-        A dictionary matching the provided schema with extracted information
-    """
-    generate_response = action_context.get("llm")
-
-    # Try up to 3 times to get valid JSON
-    for i in range(3):
-        try:
-            # Send prompt with schema instruction and get response
-            response = generate_response(
-                Prompt(messages=[{
-                    "role":
-                    "system",
-                    "content":
-                    f"You MUST produce output that adheres to the following JSON schema:\n\n{json.dumps(schema, indent=4)}. Output your JSON in a ```json markdown block."
-                }, {
-                    "role": "user",
-                    "content": prompt
-                }]))
-
-            # Check if the response has json inside of a markdown code block
-            if "```json" in response:
-                # Search from the front and then the back
-                start = response.find("```json")
-                end = response.rfind("```")
-                response = response[start + 7:end].strip()
-
-            # Parse and validate the JSON response
-            return json.loads(response)
-
-        except Exception as e:
-            if i == 2:  # On last try, raise the error
-                raise e
-            print(f"Error generating response: {e}")
-            print("Retrying...")
-
-
-@register_tool()
 def prompt_expert(action_context: ActionContext, description_of_expert: str,
                   prompt: str) -> str:
     """
@@ -574,108 +584,85 @@ def prompt_expert(action_context: ActionContext, description_of_expert: str,
     return response
 
 
-@register_tool(tags=["invoice_processing", "categorization"])
-def categorize_expenditure(action_context: ActionContext,
-                           description: str) -> str:
+@register_tool()
+def develop_feature(action_context: ActionContext,
+                    feature_request: str) -> dict:
     """
-    Categorize an invoice expenditure based on a short description.
-    
-    Args:
-        description: A one-sentence summary of the expenditure.
-        
-    Returns:
-        A category name from the predefined set of 20 categories.
+    Process a feature request through a chain of expert personas.
     """
-    categories = [
-        "Office Supplies", "IT Equipment", "Software Licenses",
-        "Consulting Services", "Travel Expenses", "Marketing",
-        "Training & Development", "Facilities Maintenance", "Utilities",
-        "Legal Services", "Insurance", "Medical Services", "Payroll",
-        "Research & Development", "Manufacturing Supplies", "Construction",
-        "Logistics", "Customer Support", "Security Services", "Miscellaneous"
-    ]
-
-    return prompt_expert(
-        action_context=action_context,
-        description_of_expert=
-        "A senior financial analyst with deep expertise in corporate spending categorization.",
-        prompt=
-        f"Given the following description: '{description}', classify the expense into one of these categories:\n{categories}"
+    # Step 1: Product expert defines requirements
+    requirements = prompt_expert(
+        action_context, "product manager expert",
+        f"Convert this feature request into detailed requirements: {feature_request}"
     )
 
+    # Step 2: Architecture expert designs the solution
+    architecture = prompt_expert(
+        action_context, "software architect expert",
+        f"Design an architecture for these requirements: {requirements}")
 
-@register_tool(tags=["invoice_processing", "validation"])
-def check_purchasing_rules(action_context: ActionContext,
-                           invoice_data: dict) -> dict:
-    """
-    Validate an invoice against company purchasing policies, returning a structured response.
-    
-    Args:
-        invoice_data: Extracted invoice details, including vendor, amount, and line items.
-        
-    Returns:
-        A structured JSON response indicating whether the invoice is compliant and why.
-    """
-    rules_path = "config/purchasing_rules.txt"
+    # Step 3: Developer expert implements the code
+    implementation = prompt_expert(
+        action_context, "senior developer expert",
+        f"Implement code for this architecture: {architecture}")
 
-    try:
-        with open(rules_path, "r") as f:
-            purchasing_rules = f.read()
-    except FileNotFoundError:
-        purchasing_rules = "No rules available. Assume all invoices are compliant."
+    # Step 4: QA expert creates test cases
+    tests = prompt_expert(
+        action_context, "QA engineer expert",
+        f"Create test cases for this implementation: {implementation}")
 
-    validation_schema = {
-        "type": "object",
-        "properties": {
-            "compliant": {
-                "type": "boolean"
-            },
-            "issues": {
-                "type": "string"
-            }
-        }
+    # Step 5: Documentation expert creates documentation
+    documentation = prompt_expert(
+        action_context, "technical writer expert",
+        f"Document this implementation: {implementation}")
+
+    return {
+        "requirements": requirements,
+        "architecture": architecture,
+        "implementation": implementation,
+        "tests": tests,
+        "documentation": documentation
     }
 
-    return prompt_llm_for_json(action_context=action_context,
-                               schema=validation_schema,
-                               prompt=f"""
-        Given this invoice data: {invoice_data}, check whether it complies with company purchasing rules.
-        The latest purchasing rules are as follows:
-        
-        {purchasing_rules}
-        
-        Respond with a JSON object containing:
-        - `compliant`: true if the invoice follows all policies, false otherwise.
-        - `issues`: A brief explanation of any violations or missing requirements.
-        """)
+
+@register_tool(tags=["system"], terminal=True)
+def terminate(message: str) -> str:
+    """Terminates the agent's execution with a final message.
+
+    Args:
+        message: The final message to return before terminating
+
+    Returns:
+        The message with a termination note appended
+    """
+    return f"{message}\nTerminating..."
 
 
-def create_invoice_agent():
-    # Create action registry with invoice tools
+def create_coa_agent():
+    # Create action registry with our invoice tools
     action_registry = PythonActionRegistry()
 
-    # Define invoice processing goals
+    # Create our base environment
+    environment = PythonEnvironment()
+
+    # Define our development goals
     goals = [
-        Goal(
-            name="Persona",
-            description=
-            "You are an Invoice Processing Agent, specialized in handling invoices efficiently."
-        ),
-        Goal(name="Process Invoices",
+        Goal(priority=1,
+             name="Generate Software Documentation via Expert Collaboration",
              description="""
-            Your goal is to process invoices accurately. For each invoice:
-            1. Extract key details such as vendor, amount, and line items.
-            2. Generate a one-sentence summary of the expenditure.
-            3. Categorize the expenditure using an expert.
-            4. Validate the invoice against purchasing policies.
-            5. Store the processed invoice with categorization and validation status.
-            6. Return a summary of the invoice processing results.
+            Your goal is to produce a concise technical documentation for a software feature request by collaborating with domain experts step-by-step.
+
+            Your steps must include:
+            1. Consulting a product management expert to define detailed requirements.
+            2. Consulting a software architect expert to design the system architecture.
+            3. Consulting a senior developer expert to implement the architecture.
+            4. Consulting a QA engineer expert to create relevant test cases.
+            5. Consulting a technical writer expert to generate comprehensive documentation.
+            6. Terminate your execution after the documentation is produced.
             """)
     ]
 
-    # Define agent environment
-    environment = Environment()
-
+    # Create the agent
     return Agent(goals=goals,
                  agent_language=AgentFunctionCallingActionLanguage(),
                  action_registry=action_registry,
@@ -685,23 +672,14 @@ def create_invoice_agent():
 
 def main():
 
-    invoice_text = """
-        Invoice #4567
-        Date: 2025-02-01
-        Vendor: Tech Solutions Inc.
-        Items: 
-        - Laptop - $1,200
-        - External Monitor - $300
-        Total: $1,500
+    agent = create_coa_agent()
+
+    # Run the agent with user's input
+    user_text = """
+    We want to add a "Dark Mode" toggle to our web application that persists user preference and adapts to system theme settings.
     """
-
-    # Create an agent instance
-    agent = create_invoice_agent()
-
-    # Process the invoice
-    response = agent.run(f"Process this invoice:\n\n{invoice_text}")
-
-    print(response)
+    final_memory = agent.run(user_text, action_context_props={})
+    print(final_memory.get_memories())
 
 
 if __name__ == "__main__":
