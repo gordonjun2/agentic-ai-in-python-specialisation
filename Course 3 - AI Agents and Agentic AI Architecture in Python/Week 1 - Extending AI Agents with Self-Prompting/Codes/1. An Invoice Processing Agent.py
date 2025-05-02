@@ -22,6 +22,21 @@ tools = {}
 tools_by_tag = {}
 
 
+def recursive_json_loads(value):
+    if isinstance(value, str):
+        try:
+            loaded = json.loads(value)
+            return recursive_json_loads(loaded)
+        except json.JSONDecodeError:
+            return value
+    elif isinstance(value, dict):
+        return {k: recursive_json_loads(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [recursive_json_loads(item) for item in value]
+    else:
+        return value
+
+
 def has_named_parameter(func, name: str) -> bool:
     """
     Check if the given function has a parameter with the specified name.
@@ -376,7 +391,7 @@ class AgentFunctionCallingActionLanguage(AgentLanguage):
         """Parse LLM response into structured format by extracting the ```json block"""
 
         try:
-            return json.loads(response)
+            return recursive_json_loads(response)
 
         except Exception as e:
             print(e)
@@ -667,7 +682,10 @@ def store_invoice(action_context: ActionContext, invoice_data: dict) -> dict:
     already exists, it will be updated.
     
     Args:
-        invoice_data: The processed invoice data to store
+        invoice_data: The processed invoice data to store. Make sure this is a 
+                        JSON object, not a stringified JSON string. 
+                        For example, use {"invoice_number": "1234", ...} instead of 
+                        '{"invoice_number": "1234", ...}'
         
     Returns:
         A dictionary containing the storage result and invoice number
