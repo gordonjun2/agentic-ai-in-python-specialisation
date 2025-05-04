@@ -7,6 +7,8 @@
 - [Building Living Software Systems with Generative & Agentic AI](https://arxiv.org/abs/2408.01768)
 - [Chain-of-Thought Prompting Elicits Reasoning in Large Language Models](https://arxiv.org/abs/2201.11903)
 - [ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629)
+- [ChatGPT Prompt Patterns for Improving Code Quality, Refactoring, Requirements Elicitation, and Software Design](https://arxiv.org/abs/2303.07839)
+- [The Prompt Report: A Systematic Survey of Prompt Engineering Techniques](https://arxiv.org/abs/2406.06608)
 
 ## Useful Jupyter Notebook Commands
 
