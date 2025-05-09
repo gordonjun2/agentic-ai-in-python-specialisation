@@ -1,5 +1,9 @@
 # Useful Links
 
+## Tools
+
+- [OpenAI Tokenizer](https://platform.openai.com/tokenizer)
+
 ## Research Papers
 
 - [A Systematic Survey of Prompt Engineering in Large Language Models: Techniques and Applications](https://arxiv.org/abs/2402.07927)
